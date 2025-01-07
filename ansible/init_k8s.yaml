@@ -1,0 +1,241 @@
+---
+- name: Run shell commands for Kubernetes setup
+  hosts: all
+  become: yes
+  tasks:
+      - name: Create k8s.conf for modules-load
+        shell: |
+            echo -e "overlay\nbr_netfilter" > /etc/modules-load.d/k8s.conf
+
+      - name: Load overlay module
+        shell: modprobe overlay
+
+      - name: Load br_netfilter module
+        shell: modprobe br_netfilter
+
+      - name: Create k8s.conf for sysctl
+        shell: |
+            echo -e "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1" > /etc/sysctl.d/k8s.conf
+
+      - name: Apply sysctl changes without reboot
+        shell: sysctl --system
+
+- name: Disable swap and set to persist across reboots
+  hosts: all
+  become: yes
+  tasks:
+      - name: Turn off swap immediately
+        shell: swapoff -a
+
+      - name: Add swapoff to crontab for persistence
+        shell: |
+            (crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | crontab -
+
+- name: Install and configure containerd
+  hosts: all
+  become: yes
+  tasks:
+      - name: Install containerd
+        apt:
+            name: containerd
+            state: present
+
+      - name: Create containerd configuration directory
+        file:
+            path: /etc/containerd
+            state: directory
+            mode: "0755"
+
+      - name: Generate default containerd configuration file
+        shell: containerd config default > /etc/containerd/config.toml
+
+      - name: Modify SystemdCgroup in containerd config
+        shell: sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+      - name: Restart containerd service
+        service:
+            name: containerd
+            state: restarted
+            enabled: yes
+
+- name: Install Kubernetes (kubelet, kubeadm, kubectl)
+  hosts: all
+  become: yes
+  tasks:
+      - name: Install required packages
+        apt:
+            name:
+                - apt-transport-https
+                - ca-certificates
+                - curl
+                - gpg
+            state: present
+            update_cache: yes
+
+      - name: Add Kubernetes GPG key
+        shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+      - name: Add Kubernetes repository to sources list
+        ansible.builtin.lineinfile:
+            path: /etc/apt/sources.list.d/kubernetes.list
+            line: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+            create: yes
+
+      - name: Update apt repository cache
+        apt:
+            update_cache: yes
+
+      - name: Install kubelet, kubeadm, kubectl
+        apt:
+            name:
+                - kubelet
+                - kubeadm
+                - kubectl
+            state: present
+
+      - name: Mark Kubernetes packages to hold
+        command: apt-mark hold kubelet kubeadm kubectl
+
+      - name: Add hostname to /etc/hosts
+        shell: |
+            IP=$(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}') && \
+            HOSTNAME=$(hostname) && \
+            echo "$IP $HOSTNAME" | sudo tee -a /etc/hosts
+        args:
+            executable: /bin/bash
+
+- name: Reset Kubernetes Cluster
+  hosts: all
+  become: yes
+  tasks:
+      - name: Reset cluster configuration
+        shell: kubeadm reset -f
+
+- name: Configure Kubernetes Cluster
+  hosts: all
+  become: yes
+  tasks:
+      - name: Generate and save kubeadm default cluster configuration
+        shell: kubeadm config print init-defaults > /root/kubeadm-config.yaml
+        args:
+            executable: /bin/bash
+        when: inventory_hostname == "master-1"
+
+      - name: Update advertiseAddress with IP of eth1
+        shell: |
+            sed -i "s/advertiseAddress:.*/advertiseAddress: $(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')/" /root/kubeadm-config.yaml
+        args:
+            executable: /bin/bash
+        when: inventory_hostname == "master-1"
+
+      - name: Update name with hostname
+        shell: |
+            sed -i "s/name:.*/name: $(hostname)/" /root/kubeadm-config.yaml
+        args:
+            executable: /bin/bash
+        when: inventory_hostname == "master-1"
+
+      - name: Add podSubnet to networking
+        shell: |
+            sed -i '/networking:/a \ \ podSubnet: 10.10.200.0/16' /root/kubeadm-config.yaml
+        args:
+            executable: /bin/bash
+        when: inventory_hostname == "master-1"
+
+      - name: Initialize Kubernetes cluster on master-1
+        shell: kubeadm init --config /root/kubeadm-config.yaml
+        when: inventory_hostname == "master-1"
+
+      - name: Copy Kubernetes admin config to root kube directory
+        copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /root/.kube/config
+            remote_src: yes
+        when: inventory_hostname == "master-1"
+
+      - name: Get kubeadm join command
+        shell: kubeadm token create --print-join-command
+        register: join_command
+        when: inventory_hostname == "master-1"
+
+      - name: Save join command to a file on master-1
+        copy:
+            content: "{{ join_command.stdout }}"
+            dest: /root/kubeadm-join-command.sh
+            mode: "0700"
+        when: inventory_hostname == "master-1"
+
+      - name: Fetch kubeadm join command to control machine
+        fetch:
+            src: /root/kubeadm-join-command.sh
+            dest: ./kubeadm-join-command.sh
+            flat: yes
+        when: inventory_hostname == "master-1"
+
+      - name: Distribute kubeadm join command to worker nodes
+        copy:
+            src: ./kubeadm-join-command.sh
+            dest: /root/kubeadm-join-command.sh
+            mode: "0700"
+        when: "'worker' in inventory_hostname"
+
+      - name: Join worker node to Kubernetes cluster
+        shell: /root/kubeadm-join-command.sh
+        args:
+            executable: /bin/bash
+        when: "'worker' in inventory_hostname"
+
+- name: Set up Fish shell aliases for kubectl and kubeadm
+  hosts: all
+  become: yes
+  tasks:
+      - name: Ensure Fish shell is installed
+        apt:
+            name: fish
+            state: present
+            update_cache: yes
+
+      - name: Create Fish configuration directory if it doesn't exist
+        file:
+            path: ~/.config/fish/functions
+            state: directory
+            mode: "0755"
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+
+      - name: Add alias for kubectl (k)
+        copy:
+            dest: ~/.config/fish/functions/k.fish
+            content: |
+                function k
+                  kubectl $argv
+                end
+            mode: "0644"
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+
+      - name: Add alias for kubeadm (kadm)
+        copy:
+            dest: ~/.config/fish/functions/kadm.fish
+            content: |
+                function kadm
+                  kubeadm $argv
+                end
+            mode: "0644"
+            owner: "{{ ansible_user_id }}"
+            group: "{{ ansible_user_id }}"
+
+- name: Install k9s on master-1
+  hosts: master-1
+  become: yes
+  tasks:
+      - name: Download and install k9s
+        shell: |
+            wget https://github.com/derailed/k9s/releases/download/v0.32.7/k9s_linux_amd64.deb
+            apt install -y ./k9s_linux_amd64.deb
+            rm k9s_linux_amd64.deb
+        args:
+            creates: /usr/local/bin/k9s
